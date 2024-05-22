@@ -19,16 +19,16 @@ import (
 const version = "1.0.0"
 
 type MessageQueue struct {
-	db        *sql.DB
-	lock      sync.Mutex
-	cond      *sync.Cond
+	db   *sql.DB
+	lock sync.Mutex
+	cond *sync.Cond
 }
 
 type Stats struct {
-	EnqueueCount            int
-	DequeueCount            int
-	DeleteCount             int
-	GetQueueLengthCount     int
+	EnqueueCount             int
+	DequeueCount             int
+	DeleteCount              int
+	GetQueueLengthCount      int
 	GetUniqueQueueNamesCount int
 }
 
@@ -39,9 +39,9 @@ type EnqueueRequest struct {
 }
 
 type DequeueRequest struct {
-	QueueName         string `json:"queue_name" validate:"required"`
-	VisibilityTimeout int    `json:"visibility_timeout" validate:"required,min=1"`
-	PollInterval      int    `json:"poll_interval" validate:"omitempty,min=1,max=5"`
+	QueueName            string `json:"queue_name" validate:"required"`
+	VisibilityTimeout    int    `json:"visibility_timeout" validate:"required,min=1"`
+	DatabasePollInterval int    `json:"database_poll_interval" validate:"omitempty,min=1,max=5"`
 }
 
 type DeleteRequest struct {
@@ -122,7 +122,7 @@ func (mq *MessageQueue) Enqueue(queueName, message string, priority int) error {
 	return nil
 }
 
-func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, pollInterval int) (string, string, error) {
+func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePollInterval int) (string, string, error) {
 	mq.lock.Lock()
 	defer mq.lock.Unlock()
 
@@ -293,13 +293,13 @@ func dequeueHandler(mq *MessageQueue) http.HandlerFunc {
 			return
 		}
 
-		pollInterval := req.PollInterval
-		if pollInterval == 0 {
-			pollInterval = 1
+		databasePollInterval := req.DatabasePollInterval
+		if databasePollInterval == 0 {
+			databasePollInterval = 1
 		}
 
 		timeout := time.After(30 * time.Second)
-		ticker := time.NewTicker(time.Duration(pollInterval) * time.Second)
+		ticker := time.NewTicker(time.Duration(databasePollInterval) * time.Second)
 		defer ticker.Stop()
 
 		for {
@@ -308,7 +308,7 @@ func dequeueHandler(mq *MessageQueue) http.HandlerFunc {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			case <-ticker.C:
-				message, deleteToken, err := mq.Dequeue(req.QueueName, req.VisibilityTimeout, pollInterval)
+				message, deleteToken, err := mq.Dequeue(req.QueueName, req.VisibilityTimeout, databasePollInterval)
 				if err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
@@ -436,10 +436,10 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("Endpoints:")
 	fmt.Println("  POST /enqueue             Enqueue a message")
-	fmt.Println("  POST /dequeue             Dequeue a message with optional poll interval")
+	fmt.Println("  POST /dequeue             Dequeue a message with optional database poll interval")
 	fmt.Println("  POST /delete              Delete a message using delete token")
 	fmt.Println("  POST /queue_length        Get the length of a specific queue")
-	fmt.Println("  GET  /unique_queue_names  Get unique queue names and their counts")
+	fmt.Println("  GET  /queue_names  Get unique queue names and their counts")
 	fmt.Println("  GET  /stats               Display statistics about the requests")
 }
 
@@ -470,7 +470,7 @@ func main() {
 	http.HandleFunc("/dequeue", dequeueHandler(queue))
 	http.HandleFunc("/delete", deleteHandler(queue))
 	http.HandleFunc("/queue_length", getQueueLengthHandler(queue))
-	http.HandleFunc("/unique_queue_names", getUniqueQueueNamesHandler(queue))
+	http.HandleFunc("/queue_names", getUniqueQueueNamesHandler(queue))
 	http.HandleFunc("/stats", statsHandler())
 
 	address := fmt.Sprintf("%s:%s", *host, *port)
