@@ -17,6 +17,8 @@ import (
 )
 
 const version = "1.0.0"
+const defaultVisibilityTimeout = 30
+const maxVisibilityTimeout = 43200
 
 type MessageQueue struct {
 	db   *sql.DB
@@ -40,7 +42,7 @@ type EnqueueRequest struct {
 
 type DequeueRequest struct {
 	QueueName            string `json:"queue_name" validate:"required"`
-	VisibilityTimeout    int    `json:"visibility_timeout" validate:"required,min=1"`
+	VisibilityTimeout    int    `json:"visibility_timeout" validate:"omitempty"`
 	DatabasePollInterval int    `json:"database_poll_interval" validate:"omitempty,min=1,max=5"`
 }
 
@@ -125,6 +127,14 @@ func (mq *MessageQueue) Enqueue(queueName, message string, priority int) error {
 func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePollInterval int) (string, string, error) {
 	mq.lock.Lock()
 	defer mq.lock.Unlock()
+
+	if visibilityTimeout == 0 {
+		visibilityTimeout = defaultVisibilityTimeout // Default visibility timeout if not provided
+	} else if visibilityTimeout > maxVisibilityTimeout {
+		visibilityTimeout = maxVisibilityTimeout // Cap visibility timeout at 12 hours
+	} else if visibilityTimeout < 0 {
+		visibilityTimeout = 0 // Minimum visibility timeout is 0 seconds
+	}
 
 	currentTime := time.Now().Unix()
 	selectStmt := `
