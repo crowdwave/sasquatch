@@ -449,7 +449,7 @@ func printHelp() {
 	fmt.Println("  POST /dequeue             Dequeue a message with optional database poll interval")
 	fmt.Println("  POST /delete              Delete a message using delete token")
 	fmt.Println("  POST /queue_length        Get the length of a specific queue")
-	fmt.Println("  GET  /queue_names  Get unique queue names and their counts")
+	fmt.Println("  GET  /unique_queue_names  Get unique queue names and their counts")
 	fmt.Println("  GET  /stats               Display statistics about the requests")
 }
 
@@ -480,7 +480,7 @@ func main() {
 	http.HandleFunc("/dequeue", dequeueHandler(queue))
 	http.HandleFunc("/delete", deleteHandler(queue))
 	http.HandleFunc("/queue_length", getQueueLengthHandler(queue))
-	http.HandleFunc("/queue_names", getUniqueQueueNamesHandler(queue))
+	http.HandleFunc("/unique_queue_names", getUniqueQueueNamesHandler(queue))
 	http.HandleFunc("/stats", statsHandler())
 
 	address := fmt.Sprintf("%s:%s", *host, *port)
