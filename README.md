@@ -24,6 +24,7 @@ The queueing system is a message queue service built on SQLite, providing a way 
 2. **Processing**:
    - The server locks the database to ensure thread safety.
    - It then inserts the message into the specified queue with the provided attributes. The creation time is recorded in nanoseconds for high precision.
+   - After a successful enqueue, the server broadcasts a signal to any waiting dequeue requests to check the database immediately.
 
 3. **Response**:
    - The server increments the enqueue counter for statistics and responds with a status indicating success or failure.
@@ -38,7 +39,7 @@ curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1","mes
 **Endpoint**: `POST /dequeue`
 
 1. **Request Structure**:
-   - Clients send a request with a JSON body containing `queue_name`, `visibility_timeout`, and optionally `poll_interval`.
+   - Clients send a request with a JSON body containing `queue_name`, `visibility_timeout`, and optionally `database_poll_interval`.
 
 2. **Processing**:
    - The server locks the database and attempts to retrieve a message from the specified queue.
@@ -121,26 +122,6 @@ curl -X GET http://localhost:8080/unique_queue_names
 curl -X GET http://localhost:8080/stats
 ```
 
-### Additional Information
-
-**Server Configuration**:
-- The server can be configured to listen on a specific port and host using command-line options `--port` and `--host`.
-
-**Starting the Server**:
-```sh
-go run main.go --port 9090 --host 0.0.0.0
-```
-
-**Help and Version**:
-```sh
-go run main.go --version
-go run main.go --help
-```
-
-### Summary
-
-The queueing system provides a robust way to manage message queues with support for priority, visibility timeouts, and long-polling. It ensures data integrity and handles concurrency through database locks. The system also provides endpoints for monitoring and managing the queues, making it a comprehensive solution for message queue management.
-
 ### Expanded Narrative Explanation of Long Polling Behavior in Dequeuing
 
 #### Overview
@@ -154,7 +135,7 @@ The queueing system includes a sophisticated long polling mechanism for the dequ
 #### Request Structure
 - `queue_name` (string, required): The name of the queue from which to dequeue the message.
 - `visibility_timeout` (integer, required): The time in seconds during which the dequeued message will be hidden from other dequeue calls.
-- `poll_interval` (integer, optional): The interval in seconds at which to poll the database for new messages. Must be between 1 and 5 seconds. Defaults to 1 second if not specified.
+- `database_poll_interval` (integer, optional): The interval in seconds at which to poll the database for new messages. Must be between 1 and 5 seconds. Defaults to 1 second if not specified.
 
 #### Dequeue Workflow with Long Polling
 
@@ -172,11 +153,11 @@ The queueing system includes a sophisticated long polling mechanism for the dequ
    - A timeout of 30 seconds is set to ensure that the server does not wait indefinitely.
 
 4. **Polling Loop**:
-   - The server sets up a ticker based on the `poll_interval` (defaulting to 1 second if not specified).
+   - The server sets up a ticker based on the `database_poll_interval` (defaulting to 1 second if not specified).
    - The server then enters a loop where it periodically re-attempts to dequeue a message at each tick of the ticker.
 
 5. **Repeated Dequeue Attempts**:
-   - At each tick (determined by `poll_interval`), the server locks the database again and retries the dequeue operation.
+   - At each tick (determined by `database_poll_interval`), the server locks the database again and retries the dequeue operation.
    - This involves executing the same SQL query to find an unprocessed and currently visible message.
 
 6. **Successful Dequeue During Polling**:
@@ -189,13 +170,13 @@ The queueing system includes a sophisticated long polling mechanism for the dequ
 #### Example Long Polling Dequeue Request
 
 ```sh
-curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1","visibility_timeout":10,"poll_interval":2}' http://localhost:8080/dequeue
+curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1","visibility_timeout":10,"database_poll_interval":2}' http://localhost:8080/dequeue
 ```
 
 #### Detailed Long Polling Flow
 
 1. **Client Sends Dequeue Request**:
-   - The client sends a POST request to `/dequeue` with the specified queue name, visibility timeout, and optional poll interval.
+   - The client sends a POST request to `/dequeue` with the specified queue name, visibility timeout, and optional database poll interval.
 
 2. **Server Attempts Immediate Dequeue**:
    - The server attempts to fetch a message from the specified queue. If successful, it returns the message and delete token immediately.
@@ -218,16 +199,16 @@ curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1","vis
    - Long polling reduces the need for clients to repeatedly send requests, thus conserving network and server resources.
 
 2. **Real-Time Updates**:
-   - Clients can receive messages as soon as they become available, providing near real-time updates without the need for constant polling.
+   - Clients can receive messages as soon as
+
+ they become available, providing near real-time updates without the need for constant polling.
 
 3. **Efficient Waiting**:
    - The server efficiently manages the wait time by periodically checking for new messages, ensuring that clients do not experience unnecessary delays.
 
 ### Summary
 
-The long polling mechanism in the dequeue operation ensures efficient and timely retrieval of messages from the queue. It balances the need for real-time updates with the efficient use of resources by allowing clients to wait for messages without constantly sending requests. The 30-second timeout ensures that clients are not left waiting indefinitely, while the poll interval allows for configurable and controlled polling behavior. This design makes the message queue system robust and responsive, suitable for a variety of applications requiring reliable message handling and delivery.
-
-
+The long polling mechanism in the dequeue operation ensures efficient and timely retrieval of messages from the queue. It balances the need for real-time updates with the efficient use of resources by allowing clients to wait for messages without constantly sending requests. The 30-second timeout ensures that clients are not left waiting indefinitely, while the database poll interval allows for configurable and controlled polling behavior. This design makes the message queue system robust and responsive, suitable for a variety of applications requiring reliable message handling and delivery.
 
 ### API Reference
 
@@ -270,14 +251,14 @@ curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue2","mes
 **Request Body:**
 - `queue_name` (string, required): The name of the queue.
 - `visibility_timeout` (integer, required): The time in seconds to hide the message from other dequeue calls.
-- `poll_interval` (integer, optional): The interval in seconds to poll the database, between 1 and 5. Default is 1.
+- `database_poll_interval` (integer, optional): The interval in seconds to poll the database, between 1 and 5. Default is 1.
 
 **Curl Examples:**
 ```sh
 curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1","visibility_timeout":10}' http://localhost:8080/dequeue
-curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1","visibility_timeout":10,"poll_interval":2}' http://localhost:8080/dequeue
+curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1","visibility_timeout":10,"database_poll_interval":2}' http://localhost:8080/dequeue
 curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue2","visibility_timeout":20}' http://localhost:8080/dequeue
-curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue2","visibility_timeout":20,"poll_interval":3}' http://localhost:8080/dequeue
+curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue2","visibility_timeout":20,"database_poll_interval":3}' http://localhost:8080/dequeue
 ```
 
 ---
