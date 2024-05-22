@@ -19,15 +19,16 @@ import (
 const version = "1.0.0"
 
 type MessageQueue struct {
-	db   *sql.DB
-	lock sync.Mutex
+	db        *sql.DB
+	lock      sync.Mutex
+	cond      *sync.Cond
 }
 
 type Stats struct {
-	EnqueueCount           int
-	DequeueCount           int
-	DeleteCount            int
-	GetQueueLengthCount    int
+	EnqueueCount            int
+	DequeueCount            int
+	DeleteCount             int
+	GetQueueLengthCount     int
 	GetUniqueQueueNamesCount int
 }
 
@@ -72,6 +73,7 @@ func NewMessageQueue(dbFilePath string) (*MessageQueue, error) {
 	}
 
 	mq := &MessageQueue{db: db}
+	mq.cond = sync.NewCond(&mq.lock)
 	if err := mq.initialize(); err != nil {
 		return nil, err
 	}
@@ -115,6 +117,8 @@ func (mq *MessageQueue) Enqueue(queueName, message string, priority int) error {
 	if err != nil {
 		return fmt.Errorf("failed to execute enqueue statement: %w", err)
 	}
+
+	mq.cond.Broadcast() // Signal waiting dequeue requests
 	return nil
 }
 
@@ -134,36 +138,39 @@ func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, pollInterva
 		WHERE id = ?
 	`
 
-	tx, err := mq.db.Begin()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to begin transaction: %w", err)
-	}
-
-	var id int
-	var message string
-	err = tx.QueryRow(selectStmt, queueName, currentTime).Scan(&id, &message)
-	if err != nil {
-		tx.Rollback()
-		if err == sql.ErrNoRows {
-			return "", "", nil
+	for {
+		tx, err := mq.db.Begin()
+		if err != nil {
+			return "", "", fmt.Errorf("failed to begin transaction: %w", err)
 		}
-		return "", "", fmt.Errorf("failed to select message: %w", err)
-	}
 
-	newVisibilityTimestamp := currentTime + int64(visibilityTimeout)
-	deleteToken := uuid.New().String()
-	_, err = tx.Exec(updateStmt, newVisibilityTimestamp, deleteToken, id)
-	if err != nil {
-		tx.Rollback()
-		return "", "", fmt.Errorf("failed to update message: %w", err)
-	}
+		var id int
+		var message string
+		err = tx.QueryRow(selectStmt, queueName, currentTime).Scan(&id, &message)
+		if err != nil {
+			tx.Rollback()
+			if err == sql.ErrNoRows {
+				mq.cond.Wait() // Wait for signal from enqueue
+				continue
+			}
+			return "", "", fmt.Errorf("failed to select message: %w", err)
+		}
 
-	err = tx.Commit()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to commit transaction: %w", err)
-	}
+		newVisibilityTimestamp := currentTime + int64(visibilityTimeout)
+		deleteToken := uuid.New().String()
+		_, err = tx.Exec(updateStmt, newVisibilityTimestamp, deleteToken, id)
+		if err != nil {
+			tx.Rollback()
+			return "", "", fmt.Errorf("failed to update message: %w", err)
+		}
 
-	return message, deleteToken, nil
+		err = tx.Commit()
+		if err != nil {
+			return "", "", fmt.Errorf("failed to commit transaction: %w", err)
+		}
+
+		return message, deleteToken, nil
+	}
 }
 
 func (mq *MessageQueue) DeleteMessage(deleteToken string) (bool, error) {
