@@ -43,7 +43,7 @@ curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1","mes
 
 2. **Processing**:
    - The server locks the database and attempts to retrieve a message from the specified queue.
-   - If a message is found, it updates the visibility timestamp to hide it for the specified timeout period and generates a unique delete token.
+   - If a message is found, it updates the visibility timestamp to hide it for the specified timeout period (default: 30 seconds, min: 0 seconds, max: 12 hours) and generates a unique delete token.
    - If no message is found, the server enters a long-polling mode, periodically checking for new messages until a message is found or a 30-second timeout is reached.
 
 3. **Response**:
@@ -134,7 +134,7 @@ The queueing system includes a sophisticated long polling mechanism for the dequ
 
 #### Request Structure
 - `queue_name` (string, required): The name of the queue from which to dequeue the message.
-- `visibility_timeout` (integer, required): The time in seconds during which the dequeued message will be hidden from other dequeue calls.
+- `visibility_timeout` (integer, optional): The time in seconds during which the dequeued message will be hidden from other dequeue calls. Defaults to 30 seconds, with a minimum of 0 seconds and a maximum of 12 hours (43200 seconds).
 - `database_poll_interval` (integer, optional): The interval in seconds at which to poll the database for new messages. Must be between 1 and 5 seconds. Defaults to 1 second if not specified.
 
 #### Dequeue Workflow with Long Polling
@@ -195,13 +195,13 @@ curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1","vis
 
 ### Advantages of Long Polling
 
-1. **Reduced Resource Usage**:
+1.
+
+ **Reduced Resource Usage**:
    - Long polling reduces the need for clients to repeatedly send requests, thus conserving network and server resources.
 
 2. **Real-Time Updates**:
-   - Clients can receive messages as soon as
-
- they become available, providing near real-time updates without the need for constant polling.
+   - Clients can receive messages as soon as they become available, providing near real-time updates without the need for constant polling.
 
 3. **Efficient Waiting**:
    - The server efficiently manages the wait time by periodically checking for new messages, ensuring that clients do not experience unnecessary delays.
@@ -250,7 +250,7 @@ curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue2","mes
 
 **Request Body:**
 - `queue_name` (string, required): The name of the queue.
-- `visibility_timeout` (integer, required): The time in seconds to hide the message from other dequeue calls.
+- `visibility_timeout` (integer, optional): The time in seconds to hide the message from other dequeue calls. Defaults to 30 seconds, with a minimum of 0 seconds and a maximum of 12 hours (43200 seconds).
 - `database_poll_interval` (integer, optional): The interval in seconds to poll the database, between 1 and 5. Default is 1.
 
 **Curl Examples:**
