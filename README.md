@@ -94,7 +94,7 @@ curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1"}' ht
 
 #### Getting Unique Queue Names
 
-**Endpoint**: `GET /unique_queue_names`
+**Endpoint**: `GET /queue_names`
 
 1. **Processing**:
    - The server locks the database and retrieves all unique queue names along with the count of messages in each queue.
@@ -104,7 +104,7 @@ curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue1"}' ht
 
 **Example**:
 ```sh
-curl -X GET http://localhost:8080/unique_queue_names
+curl -X GET http://localhost:8080/queue_names
 ```
 
 #### Getting Stats
@@ -299,13 +299,13 @@ curl -X POST -H "Content-Type: application/json" -d '{"queue_name":"queue3"}' ht
 
 ### Get Unique Queue Names
 
-**Endpoint:** `GET /unique_queue_names`
+**Endpoint:** `GET /queue_names`
 
 **Description:** Gets a list of all unique queue names and the count of messages in each queue.
 
 **Curl Examples:**
 ```sh
-curl -X GET http://localhost:8080/unique_queue_names
+curl -X GET http://localhost:8080/queue_names
 ```
 
 ---
