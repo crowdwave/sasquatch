@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 
@@ -35,13 +36,13 @@ type Stats struct {
 }
 
 type EnqueueRequest struct {
-	QueueName string `json:"queue_name" validate:"required"`
+	QueueName string `json:"queue_name" validate:"required,queue_name"`
 	Message   string `json:"message" validate:"required"`
 	Priority  int    `json:"priority"`
 }
 
 type DequeueRequest struct {
-	QueueName            string `json:"queue_name" validate:"required"`
+	QueueName            string `json:"queue_name" validate:"required,queue_name"`
 	VisibilityTimeout    int    `json:"visibility_timeout" validate:"omitempty"`
 	DatabasePollInterval int    `json:"database_poll_interval" validate:"omitempty,min=1,max=5"`
 }
@@ -51,7 +52,7 @@ type DeleteRequest struct {
 }
 
 type QueueLengthRequest struct {
-	QueueName string `json:"queue_name" validate:"required"`
+	QueueName string `json:"queue_name" validate:"required,queue_name"`
 }
 
 type QueueLengthResponse struct {
@@ -62,6 +63,10 @@ type QueueLengthResponse struct {
 type UniqueQueueNamesResponse struct {
 	QueueName string `json:"queue_name"`
 	Count     int    `json:"count"`
+}
+
+type DeleteAllRequest struct {
+	QueueName string `json:"queue_name" validate:"required,queue_name"`
 }
 
 var validate *validator.Validate
@@ -150,16 +155,16 @@ func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePol
 
 	for {
 		tx, err := mq.db.Begin()
-		if err != nil {
+		if (err != nil) {
 			return "", "", fmt.Errorf("failed to begin transaction: %w", err)
 		}
 
 		var id int
 		var message string
 		err = tx.QueryRow(selectStmt, queueName, currentTime).Scan(&id, &message)
-		if err != nil {
+		if (err != nil) {
 			tx.Rollback()
-			if err == sql.ErrNoRows {
+			if (err == sql.ErrNoRows) {
 				mq.cond.Wait() // Wait for signal from enqueue
 				continue
 			}
@@ -169,13 +174,13 @@ func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePol
 		newVisibilityTimestamp := currentTime + int64(visibilityTimeout)
 		deleteToken := uuid.New().String()
 		_, err = tx.Exec(updateStmt, newVisibilityTimestamp, deleteToken, id)
-		if err != nil {
+		if (err != nil) {
 			tx.Rollback()
 			return "", "", fmt.Errorf("failed to update message: %w", err)
 		}
 
 		err = tx.Commit()
-		if err != nil {
+		if (err != nil) {
 			return "", "", fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
@@ -211,6 +216,41 @@ func (mq *MessageQueue) DeleteMessage(deleteToken string) (bool, error) {
 	}
 
 	return rowsAffected > 0, nil
+}
+
+func (mq *MessageQueue) DeleteAllMessages(queueName string) error {
+	mq.lock.Lock()
+	defer mq.lock.Unlock()
+
+	var deleteStmt string
+	if queueName == "*" {
+		deleteStmt = "DELETE FROM messages"
+	} else {
+		deleteStmt = "DELETE FROM messages WHERE queue_name = ?"
+	}
+
+	tx, err := mq.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	if queueName == "*" {
+		_, err = tx.Exec(deleteStmt)
+	} else {
+		_, err = tx.Exec(deleteStmt, queueName)
+	}
+
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to execute delete statement: %w", err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
 }
 
 func (mq *MessageQueue) GetQueueLength(queueName string) (int, error) {
@@ -364,6 +404,29 @@ func deleteHandler(mq *MessageQueue) http.HandlerFunc {
 	}
 }
 
+func deleteAllHandler(mq *MessageQueue) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req DeleteAllRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if err := validate.Struct(req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		err := mq.DeleteAllMessages(req.QueueName)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
 func getQueueLengthHandler(mq *MessageQueue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req QueueLengthRequest
@@ -448,6 +511,7 @@ func printHelp() {
 	fmt.Println("  POST /enqueue             Enqueue a message")
 	fmt.Println("  POST /dequeue             Dequeue a message with optional database poll interval")
 	fmt.Println("  POST /delete              Delete a message using delete token")
+	fmt.Println("  POST /delete_all          Delete all messages in a specified queue or all messages in the database")
 	fmt.Println("  POST /queue_length        Get the length of a specific queue")
 	fmt.Println("  GET  /unique_queue_names  Get unique queue names and their counts")
 	fmt.Println("  GET  /stats               Display statistics about the requests")
@@ -471,6 +535,11 @@ func main() {
 	}
 
 	validate = validator.New()
+	validate.RegisterValidation("queue_name", func(fl validator.FieldLevel) bool {
+		re := regexp.MustCompile(`^[a-zA-Z0-9-_]+$`)
+		return re.MatchString(fl.Field().String())
+	})
+
 	queue, err := NewMessageQueue("messageQueue.db")
 	if err != nil {
 		log.Fatal(err)
@@ -479,6 +548,7 @@ func main() {
 	http.HandleFunc("/enqueue", enqueueHandler(queue))
 	http.HandleFunc("/dequeue", dequeueHandler(queue))
 	http.HandleFunc("/delete", deleteHandler(queue))
+	http.HandleFunc("/delete_all", deleteAllHandler(queue))
 	http.HandleFunc("/queue_length", getQueueLengthHandler(queue))
 	http.HandleFunc("/unique_queue_names", getUniqueQueueNamesHandler(queue))
 	http.HandleFunc("/stats", statsHandler())
