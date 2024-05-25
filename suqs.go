@@ -2,13 +2,14 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,17 +18,20 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const version = "1.0.0"
+const version = "2"
 const defaultVisibilityTimeout = 30
 const maxVisibilityTimeout = 43200
 const maxReceives = 4                  // Define maximum receive count
 const cleanupInterval = 1 * time.Minute // Interval for running the cleanup task
+const defaultMaxMessageSize = 256 * 1024 // Default maximum message size in bytes
+const maxAllowedMessageSize = 10 * 1024 * 1024 // Maximum allowed message size in bytes (10MB)
 
 type MessageQueue struct {
-	db            *sql.DB
-	lock          sync.Mutex
-	cond          *sync.Cond
+	db             *sql.DB
+	lock           sync.Mutex
+	cond           *sync.Cond
 	maxQueueLength int
+	maxMessageSize int
 }
 
 type Stats struct {
@@ -40,7 +44,7 @@ type Stats struct {
 
 type EnqueueRequest struct {
 	QueueName string `json:"queue_name" validate:"required,queue_name"`
-	Message   string `json:"message" validate:"required"`
+	Message   []byte `json:"message" validate:"required"`
 	Priority  int    `json:"priority"`
 }
 
@@ -76,13 +80,13 @@ var validate *validator.Validate
 var stats Stats
 var statsLock sync.Mutex
 
-func NewMessageQueue(dbFilePath string, maxQueueLength int) (*MessageQueue, error) {
+func NewMessageQueue(dbFilePath string, maxQueueLength, maxMessageSize int) (*MessageQueue, error) {
 	db, err := sql.Open("sqlite3", dbFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	mq := &MessageQueue{db: db, maxQueueLength: maxQueueLength}
+	mq := &MessageQueue{db: db, maxQueueLength: maxQueueLength, maxMessageSize: maxMessageSize}
 	mq.cond = sync.NewCond(&mq.lock)
 	if err := mq.initialize(); err != nil {
 		return nil, err
@@ -99,7 +103,7 @@ func (mq *MessageQueue) initialize() error {
 		CREATE TABLE IF NOT EXISTS messages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			queue_name TEXT NOT NULL,
-			message TEXT NOT NULL,
+			message BLOB NOT NULL,
 			processed INTEGER DEFAULT 0,
 			visibility_timestamp INTEGER DEFAULT 0,
 			delete_token TEXT,
@@ -139,7 +143,7 @@ func (mq *MessageQueue) cleanupOldMessages() {
 	}
 }
 
-func (mq *MessageQueue) Enqueue(queueName, message string, priority int) error {
+func (mq *MessageQueue) Enqueue(queueName string, message []byte, priority int) error {
 	mq.lock.Lock()
 	defer mq.lock.Unlock()
 
@@ -151,6 +155,10 @@ func (mq *MessageQueue) Enqueue(queueName, message string, priority int) error {
 
 	if count >= mq.maxQueueLength {
 		return fmt.Errorf("queue %s is full", queueName)
+	}
+
+	if len(message) > mq.maxMessageSize {
+		return fmt.Errorf("message size exceeds maximum limit of %d bytes", mq.maxMessageSize)
 	}
 
 	createdAt := time.Now().UnixNano()
@@ -182,7 +190,7 @@ func (mq *MessageQueue) getQueueLength(queueName string) (int, error) {
 	return count, nil
 }
 
-func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePollInterval int) (string, string, error) {
+func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePollInterval int) ([]byte, string, error) {
 	// Preliminary check without locking
 	currentTime := time.Now().Unix()
 	selectStmt := `
@@ -191,15 +199,15 @@ func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePol
 		ORDER BY priority DESC, created_at DESC, id DESC LIMIT 1
 	`
 	var id int
-	var message string
+	var message []byte
 	var receiveCount int
 	err := mq.db.QueryRow(selectStmt, queueName, currentTime).Scan(&id, &message, &receiveCount)
 	if err != nil && err != sql.ErrNoRows {
-		return "", "", fmt.Errorf("failed to preliminarily select message: %w", err)
+		return nil, "", fmt.Errorf("failed to preliminarily select message: %w", err)
 	}
 	if err == sql.ErrNoRows {
 		// No message available, return immediately
-		return "", "", nil
+		return nil, "", nil
 	}
 
 	// Locking section for the actual dequeue operation
@@ -222,7 +230,7 @@ func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePol
 	for {
 		tx, err := mq.db.Begin()
 		if err != nil {
-			return "", "", fmt.Errorf("failed to begin transaction: %w", err)
+			return nil, "", fmt.Errorf("failed to begin transaction: %w", err)
 		}
 
 		err = tx.QueryRow(selectStmt, queueName, currentTime).Scan(&id, &message, &receiveCount)
@@ -232,7 +240,7 @@ func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePol
 				mq.cond.Wait() // Wait for signal from enqueue
 				continue
 			}
-			return "", "", fmt.Errorf("failed to select message: %w", err)
+			return nil, "", fmt.Errorf("failed to select message: %w", err)
 		}
 
 		// Check if the message has exceeded the max receive count
@@ -242,11 +250,11 @@ func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePol
 			_, err := tx.Exec(deleteStmt, id)
 			if err != nil {
 				tx.Rollback()
-				return "", "", fmt.Errorf("failed to delete poison message: %w", err)
+				return nil, "", fmt.Errorf("failed to delete poison message: %w", err)
 			}
 			err = tx.Commit()
 			if err != nil {
-				return "", "", fmt.Errorf("failed to commit transaction: %w", err)
+				return nil, "", fmt.Errorf("failed to commit transaction: %w", err)
 			}
 			mq.cond.Broadcast()
 			continue // Retry the loop to get the next message
@@ -257,12 +265,12 @@ func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePol
 		_, err = tx.Exec(updateStmt, newVisibilityTimestamp, deleteToken, id)
 		if err != nil {
 			tx.Rollback()
-			return "", "", fmt.Errorf("failed to update message: %w", err)
+			return nil, "", fmt.Errorf("failed to update message: %w", err)
 		}
 
 		err = tx.Commit()
 		if err != nil {
-			return "", "", fmt.Errorf("failed to commit transaction: %w", err)
+			return nil, "", fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
 		return message, deleteToken, nil
@@ -390,18 +398,31 @@ func incrementStatsCounter(counter *int) {
 
 func enqueueHandler(mq *MessageQueue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var req EnqueueRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		queueName := r.URL.Query().Get("queue_name")
+		priorityStr := r.URL.Query().Get("priority")
+		if queueName == "" || priorityStr == "" {
+			http.Error(w, "Missing queue_name or priority parameter", http.StatusBadRequest)
+			return
+		}
+
+		priority, err := strconv.Atoi(priorityStr)
+		if err != nil {
+			http.Error(w, "Invalid priority parameter", http.StatusBadRequest)
+			return
+		}
+
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
 
-		if err := validate.Struct(req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if len(body) > mq.maxMessageSize {
+			http.Error(w, fmt.Sprintf("Message size exceeds maximum limit of %d bytes", mq.maxMessageSize), http.StatusRequestEntityTooLarge)
 			return
 		}
 
-		if err := mq.Enqueue(req.QueueName, req.Message, req.Priority); err != nil {
+		if err := mq.Enqueue(queueName, body, priority); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -445,9 +466,9 @@ func dequeueHandler(mq *MessageQueue) http.HandlerFunc {
 					return
 				}
 
-				if message != "" {
+				if message != nil {
 					incrementStatsCounter(&stats.DequeueCount)
-					response := map[string]string{"message": message, "delete_token": deleteToken}
+					response := map[string]interface{}{"message": message, "delete_token": deleteToken}
 					json.NewEncoder(w).Encode(response)
 					return
 				}
@@ -583,12 +604,13 @@ func statsHandler() http.HandlerFunc {
 func printHelp() {
 	fmt.Println("Message Queue Service")
 	fmt.Println("Usage:")
-	fmt.Println("  --version       Display the version of the application")
-	fmt.Println("  --help          Display this help message")
-	fmt.Println("  --port          Specify the port to listen on (default: 8080)")
-	fmt.Println("  --host          Specify the host to listen on (default: localhost)")
-	fmt.Println("  --memory        Use in-memory database")
+	fmt.Println("  --version           Display the version of the application")
+	fmt.Println("  --help              Display this help message")
+	fmt.Println("  --port              Specify the port to listen on (default: 8080)")
+	fmt.Println("  --host              Specify the host to listen on (default: localhost)")
+	fmt.Println("  --memory            Use in-memory database")
 	fmt.Println("  --max-queue-length  Specify the maximum queue length (default: 5000)")
+	fmt.Println("  --max-message-size  Specify the maximum message size in kilobytes (default: 256, max: 10240)")
 	fmt.Println()
 	fmt.Println("Endpoints:")
 	fmt.Println("  POST /enqueue             Enqueue a message")
@@ -607,6 +629,8 @@ func main() {
 	host := flag.String("host", "localhost", "Specify the host to listen on")
 	memory := flag.Bool("memory", false, "Use in-memory database")
 	maxQueueLength := flag.Int("max-queue-length", 5000, "Specify the maximum queue length")
+	maxMessageSizeKB := flag.Int("max-message-size", 256, "Specify the maximum message size in kilobytes (max: 10240)")
+
 	flag.Parse()
 
 	if *versionFlag {
@@ -617,6 +641,10 @@ func main() {
 	if *helpFlag {
 		printHelp()
 		return
+	}
+
+	if *maxMessageSizeKB > 10240 {
+		log.Fatalf("max-message-size cannot exceed 10240 KB (10 MB)")
 	}
 
 	validate = validator.New()
@@ -630,7 +658,9 @@ func main() {
 		dbFilePath = ":memory:"
 	}
 
-	queue, err := NewMessageQueue(dbFilePath, *maxQueueLength)
+	maxMessageSize := *maxMessageSizeKB * 1024
+
+	queue, err := NewMessageQueue(dbFilePath, *maxQueueLength, maxMessageSize)
 	if err != nil {
 		log.Fatal(err)
 	}
