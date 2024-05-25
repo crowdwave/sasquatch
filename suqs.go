@@ -20,13 +20,14 @@ import (
 const version = "1.0.0"
 const defaultVisibilityTimeout = 30
 const maxVisibilityTimeout = 43200
-const maxReceives = 4               // Define maximum receive count
+const maxReceives = 4                  // Define maximum receive count
 const cleanupInterval = 1 * time.Minute // Interval for running the cleanup task
 
 type MessageQueue struct {
-	db   *sql.DB
-	lock sync.Mutex
-	cond *sync.Cond
+	db            *sql.DB
+	lock          sync.Mutex
+	cond          *sync.Cond
+	maxQueueLength int
 }
 
 type Stats struct {
@@ -75,13 +76,13 @@ var validate *validator.Validate
 var stats Stats
 var statsLock sync.Mutex
 
-func NewMessageQueue(dbFilePath string) (*MessageQueue, error) {
+func NewMessageQueue(dbFilePath string, maxQueueLength int) (*MessageQueue, error) {
 	db, err := sql.Open("sqlite3", dbFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	mq := &MessageQueue{db: db}
+	mq := &MessageQueue{db: db, maxQueueLength: maxQueueLength}
 	mq.cond = sync.NewCond(&mq.lock)
 	if err := mq.initialize(); err != nil {
 		return nil, err
@@ -142,6 +143,16 @@ func (mq *MessageQueue) Enqueue(queueName, message string, priority int) error {
 	mq.lock.Lock()
 	defer mq.lock.Unlock()
 
+	// Check current queue length
+	count, err := mq.getQueueLength(queueName)
+	if err != nil {
+		return fmt.Errorf("failed to get queue length: %w", err)
+	}
+
+	if count >= mq.maxQueueLength {
+		return fmt.Errorf("queue %s is full", queueName)
+	}
+
 	createdAt := time.Now().UnixNano()
 	stmt, err := mq.db.Prepare("INSERT INTO messages (queue_name, message, priority, created_at) VALUES (?, ?, ?, ?)")
 	if err != nil {
@@ -156,6 +167,19 @@ func (mq *MessageQueue) Enqueue(queueName, message string, priority int) error {
 
 	mq.cond.Broadcast() // Signal waiting dequeue requests
 	return nil
+}
+
+func (mq *MessageQueue) getQueueLength(queueName string) (int, error) {
+	currentTime := time.Now().Unix()
+	stmt := "SELECT COUNT(*) AS count FROM messages WHERE queue_name = ? AND processed = 0 AND visibility_timestamp <= ?"
+	row := mq.db.QueryRow(stmt, queueName, currentTime)
+
+	var count int
+	err := row.Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to scan queue length: %w", err)
+	}
+	return count, nil
 }
 
 func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePollInterval int) (string, string, error) {
@@ -544,7 +568,7 @@ func statsHandler() http.HandlerFunc {
 		`
 
 		t, err := template.New("stats").Parse(tmpl)
-		if (err != nil) {
+		if err != nil {
 			http.Error(w, "Failed to generate stats page", http.StatusInternalServerError)
 			return
 		}
@@ -564,6 +588,7 @@ func printHelp() {
 	fmt.Println("  --port          Specify the port to listen on (default: 8080)")
 	fmt.Println("  --host          Specify the host to listen on (default: localhost)")
 	fmt.Println("  --memory        Use in-memory database")
+	fmt.Println("  --max-queue-length  Specify the maximum queue length (default: 5000)")
 	fmt.Println()
 	fmt.Println("Endpoints:")
 	fmt.Println("  POST /enqueue             Enqueue a message")
@@ -571,7 +596,7 @@ func printHelp() {
 	fmt.Println("  POST /delete              Delete a message using delete token")
 	fmt.Println("  POST /delete_all          Delete all messages in a specified queue or all messages in the database")
 	fmt.Println("  POST /queue_length        Get the length of a specific queue")
-	fmt.Println("  GET  /unique_queue_names  Get unique queue names and their counts")
+	fmt.Println("  GET  /queues              Get unique queue names and their counts")
 	fmt.Println("  GET  /stats               Display statistics about the requests")
 }
 
@@ -581,6 +606,7 @@ func main() {
 	port := flag.String("port", "8080", "Specify the port to listen on")
 	host := flag.String("host", "localhost", "Specify the host to listen on")
 	memory := flag.Bool("memory", false, "Use in-memory database")
+	maxQueueLength := flag.Int("max-queue-length", 5000, "Specify the maximum queue length")
 	flag.Parse()
 
 	if *versionFlag {
@@ -604,7 +630,7 @@ func main() {
 		dbFilePath = ":memory:"
 	}
 
-	queue, err := NewMessageQueue(dbFilePath)
+	queue, err := NewMessageQueue(dbFilePath, *maxQueueLength)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -614,7 +640,7 @@ func main() {
 	http.HandleFunc("/delete", deleteHandler(queue))
 	http.HandleFunc("/delete_all", deleteAllHandler(queue))
 	http.HandleFunc("/queue_length", getQueueLengthHandler(queue))
-	http.HandleFunc("/unique_queue_names", getUniqueQueueNamesHandler(queue))
+	http.HandleFunc("/queues", getUniqueQueueNamesHandler(queue))
 	http.HandleFunc("/stats", statsHandler())
 
 	address := fmt.Sprintf("%s:%s", *host, *port)
