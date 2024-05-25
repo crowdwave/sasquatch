@@ -20,6 +20,8 @@ import (
 const version = "1.0.0"
 const defaultVisibilityTimeout = 30
 const maxVisibilityTimeout = 43200
+const maxReceives = 4               // Define maximum receive count
+const cleanupInterval = 1 * time.Minute // Interval for running the cleanup task
 
 type MessageQueue struct {
 	db   *sql.DB
@@ -85,6 +87,9 @@ func NewMessageQueue(dbFilePath string) (*MessageQueue, error) {
 		return nil, err
 	}
 
+	// Start periodic cleanup task
+	go mq.startCleanupTask()
+
 	return mq, nil
 }
 
@@ -97,7 +102,7 @@ func (mq *MessageQueue) initialize() error {
 			processed INTEGER DEFAULT 0,
 			visibility_timestamp INTEGER DEFAULT 0,
 			delete_token TEXT,
-			read_attempts INTEGER DEFAULT 0,
+			receive_count INTEGER DEFAULT 0,
 			priority INTEGER DEFAULT 0,
 			created_at INTEGER NOT NULL
 		)
@@ -107,6 +112,30 @@ func (mq *MessageQueue) initialize() error {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 	return nil
+}
+
+func (mq *MessageQueue) startCleanupTask() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+		mq.cleanupOldMessages()
+	}
+}
+
+func (mq *MessageQueue) cleanupOldMessages() {
+	mq.lock.Lock()
+	defer mq.lock.Unlock()
+
+	deleteStmt := `
+		DELETE FROM messages
+		WHERE receive_count > ?
+	`
+	_, err := mq.db.Exec(deleteStmt, maxReceives)
+	if err != nil {
+		log.Printf("Failed to cleanup old messages: %v", err)
+	}
 }
 
 func (mq *MessageQueue) Enqueue(queueName, message string, priority int) error {
@@ -130,6 +159,26 @@ func (mq *MessageQueue) Enqueue(queueName, message string, priority int) error {
 }
 
 func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePollInterval int) (string, string, error) {
+	// Preliminary check without locking
+	currentTime := time.Now().Unix()
+	selectStmt := `
+		SELECT id, message, receive_count FROM messages
+		WHERE queue_name = ? AND processed = 0 AND visibility_timestamp <= ?
+		ORDER BY priority DESC, created_at DESC, id DESC LIMIT 1
+	`
+	var id int
+	var message string
+	var receiveCount int
+	err := mq.db.QueryRow(selectStmt, queueName, currentTime).Scan(&id, &message, &receiveCount)
+	if err != nil && err != sql.ErrNoRows {
+		return "", "", fmt.Errorf("failed to preliminarily select message: %w", err)
+	}
+	if err == sql.ErrNoRows {
+		// No message available, return immediately
+		return "", "", nil
+	}
+
+	// Locking section for the actual dequeue operation
 	mq.lock.Lock()
 	defer mq.lock.Unlock()
 
@@ -141,46 +190,54 @@ func (mq *MessageQueue) Dequeue(queueName string, visibilityTimeout, databasePol
 		visibilityTimeout = 0 // Minimum visibility timeout is 0 seconds
 	}
 
-	currentTime := time.Now().Unix()
-	selectStmt := `
-		SELECT id, message FROM messages
-		WHERE queue_name = ? AND processed = 0 AND visibility_timestamp <= ?
-		ORDER BY priority DESC, created_at DESC, id DESC LIMIT 1
-	`
 	updateStmt := `
 		UPDATE messages
-		SET visibility_timestamp = ?, delete_token = ?, read_attempts = read_attempts + 1
+		SET visibility_timestamp = ?, delete_token = ?, receive_count = receive_count + 1
 		WHERE id = ?
 	`
-
 	for {
 		tx, err := mq.db.Begin()
-		if (err != nil) {
+		if err != nil {
 			return "", "", fmt.Errorf("failed to begin transaction: %w", err)
 		}
 
-		var id int
-		var message string
-		err = tx.QueryRow(selectStmt, queueName, currentTime).Scan(&id, &message)
-		if (err != nil) {
+		err = tx.QueryRow(selectStmt, queueName, currentTime).Scan(&id, &message, &receiveCount)
+		if err != nil {
 			tx.Rollback()
-			if (err == sql.ErrNoRows) {
+			if err == sql.ErrNoRows {
 				mq.cond.Wait() // Wait for signal from enqueue
 				continue
 			}
 			return "", "", fmt.Errorf("failed to select message: %w", err)
 		}
 
+		// Check if the message has exceeded the max receive count
+		if receiveCount >= maxReceives {
+			// Handle the poison message (delete or move to special queue)
+			deleteStmt := `DELETE FROM messages WHERE id = ?`
+			_, err := tx.Exec(deleteStmt, id)
+			if err != nil {
+				tx.Rollback()
+				return "", "", fmt.Errorf("failed to delete poison message: %w", err)
+			}
+			err = tx.Commit()
+			if err != nil {
+				return "", "", fmt.Errorf("failed to commit transaction: %w", err)
+			}
+			mq.cond.Broadcast()
+			continue // Retry the loop to get the next message
+		}
+
 		newVisibilityTimestamp := currentTime + int64(visibilityTimeout)
 		deleteToken := uuid.New().String()
 		_, err = tx.Exec(updateStmt, newVisibilityTimestamp, deleteToken, id)
-		if (err != nil) {
+		if err != nil {
 			tx.Rollback()
 			return "", "", fmt.Errorf("failed to update message: %w", err)
 		}
 
 		err = tx.Commit()
-		if (err != nil) {
+		if err != nil {
 			return "", "", fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
@@ -487,7 +544,7 @@ func statsHandler() http.HandlerFunc {
 		`
 
 		t, err := template.New("stats").Parse(tmpl)
-		if err != nil {
+		if (err != nil) {
 			http.Error(w, "Failed to generate stats page", http.StatusInternalServerError)
 			return
 		}
@@ -506,6 +563,7 @@ func printHelp() {
 	fmt.Println("  --help          Display this help message")
 	fmt.Println("  --port          Specify the port to listen on (default: 8080)")
 	fmt.Println("  --host          Specify the host to listen on (default: localhost)")
+	fmt.Println("  --memory        Use in-memory database")
 	fmt.Println()
 	fmt.Println("Endpoints:")
 	fmt.Println("  POST /enqueue             Enqueue a message")
@@ -522,6 +580,7 @@ func main() {
 	helpFlag := flag.Bool("help", false, "Display help message")
 	port := flag.String("port", "8080", "Specify the port to listen on")
 	host := flag.String("host", "localhost", "Specify the host to listen on")
+	memory := flag.Bool("memory", false, "Use in-memory database")
 	flag.Parse()
 
 	if *versionFlag {
@@ -540,7 +599,12 @@ func main() {
 		return re.MatchString(fl.Field().String())
 	})
 
-	queue, err := NewMessageQueue("messageQueue.db")
+	dbFilePath := "messageQueue.db"
+	if *memory {
+		dbFilePath = ":memory:"
+	}
+
+	queue, err := NewMessageQueue(dbFilePath)
 	if err != nil {
 		log.Fatal(err)
 	}
