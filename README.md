@@ -1,10 +1,12 @@
-### SUQS Simple Universal Queue Service 
+### Sasquatch Zero Config Message Queue Server
 
 ### Narrative Explanation of the Queueing System Semantics and Workflow
 
 #### Overview
 
 The queueing system is a message queue service built on SQLite, providing a way to enqueue, dequeue, and manage messages across multiple named queues. It ensures message integrity, handles concurrency, and supports features like message visibility timeouts and priorities. The system also provides endpoints for managing and retrieving information about the queues.
+
+The functionality and behaviour of Sasquatch is almost the same as Amazon SQS.
 
 #### Initialization
 
