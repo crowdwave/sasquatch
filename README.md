@@ -1,5 +1,9 @@
 ### Sasquatch Zero Config Message Queue Server
 
+### IMPORTANT! PROJECT STATUS! THIS IS EARLY CODE AND LIKELY DOES NOT EVEN COMPILE
+### ITS TOO EARLY TO DO ANYTHING USEFUL
+
+
 ### Narrative Explanation of the Queueing System Semantics and Workflow
 
 #### Overview
